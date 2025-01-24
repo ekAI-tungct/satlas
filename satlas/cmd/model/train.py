@@ -7,12 +7,13 @@ import time
 import torch
 import torchvision
 from torch.autograd import Variable
-
+from tqdm import tqdm
 import satlas.model.dataset
 import satlas.model.evaluate
 import satlas.model.models
 import satlas.model.util
 import satlas.transforms
+import pandas as pd
 
 def make_warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor, warmup_delay=0):
     def f(x):
@@ -87,7 +88,7 @@ def main(args, config):
         custom_images=config.get('CustomImages', False),
     )
 
-    print('loaded {} train, {} valid'.format(len(train_data), len(val_data)))
+    print('>>> Loaded {} train, {} valid'.format(len(train_data), len(val_data)))
 
     train_sampler_cfg = config.get('TrainSampler', {'Name': 'random'})
     if train_sampler_cfg['Name'] == 'random':
@@ -133,7 +134,7 @@ def main(args, config):
 
     # Load model if requested.
     if 'RestorePath' in config:
-        if primary: print('restoring from', config['RestorePath'])
+        # if primary: print('restoring from', config['RestorePath'])
         state_dict = torch.load(config['RestorePath'], map_location=device)
 
         # Deal with when model weights are in .pth.tar format.
@@ -174,20 +175,42 @@ def main(args, config):
                     del state_dict[k]
 
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        if primary and (missing_keys or unexpected_keys):
-            print('missing={}; unexpected={}'.format(missing_keys, unexpected_keys))
+        # if primary and (missing_keys or unexpected_keys):
+        #     print('missing={}; unexpected={}'.format(missing_keys, unexpected_keys))
 
     # Move model to the correct device.
-    model.to(device)
+    model = model.to(device)
     if is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+
+
+    # Print model layers summary
+    layer_summaries = {
+        "Backbone": 0,
+        "Intermediates": 0,
+        "Heads": 0
+    }
+    for name, param in model.named_parameters():
+        if "backbone" in name:
+            layer_summaries["Backbone"] += param.numel()
+        elif "intermediate" in name:
+            layer_summaries["Intermediates"] += param.numel()
+        elif "head" in name:
+            layer_summaries["Heads"] += param.numel()
+    
+    # Chuyển kết quả sang dataframe để in ra
+    df = pd.DataFrame([
+        {"Layer Type": key, "Total Parameters": value}
+        for key, value in layer_summaries.items()
+    ])
+    print(df)
 
     # Prepare save directory.
     save_path = config['SavePath']
     save_path = save_path.replace('LABEL', os.path.basename(args.config_path).split('.')[0])
     if primary:
         os.makedirs(save_path, exist_ok=True)
-        print('saving to', save_path)
+        print('>>> Saving to', save_path)
 
     # Construct optimizer.
     params = [p for p in model.parameters() if p.requires_grad]
@@ -209,14 +232,14 @@ def main(args, config):
                     should_freeze = True
                     break
             if should_freeze:
-                if primary: print('freeze', name)
+                # if primary: print('freeze', name)
                 param.requires_grad = False
                 freeze_params.append((name, param))
         if 'Unfreeze' in config:
             unfreeze_iters = config['Unfreeze'] // batch_size // args.world_size
             def unfreeze_hook():
                 for name, param in freeze_params:
-                    if primary: print('unfreeze', name)
+                    # if primary: print('unfreeze', name)
                     param.requires_grad = True
 
     # Configure learning rate schedulers.
@@ -249,6 +272,18 @@ def main(args, config):
     scaler = torch.cuda.amp.GradScaler(enabled=half_enabled)
 
     # Initialize training loop variables.
+    list_epoch = []
+    list_summary_epoch = []
+    list_train_loss = []
+    list_train_task_losses = []
+    list_val_loss = []
+    list_val_task_losses = []
+    list_val_score = []
+    list_best_score =[]
+    list_val_scores = []
+    list_precision = []
+    list_recall = []
+    
     best_score = None
 
     cur_iterations = 0
@@ -258,7 +293,7 @@ def main(args, config):
     train_losses = [[] for _ in config['Tasks']]
     num_epochs = config.get('NumEpochs', 100)
     num_iters = config.get('NumExamples', 0) // batch_size // args.world_size
-    if primary: print('training for {} epochs'.format(num_epochs))
+    if primary: print('### Training for {} epochs ###'.format(num_epochs))
 
     if 'EffectiveBatchSize' in config:
         accumulate_freq = config['EffectiveBatchSize'] // batch_size // args.world_size
@@ -270,16 +305,23 @@ def main(args, config):
         if num_iters > 0 and cur_iterations > num_iters:
             break
 
-        if primary: print('begin epoch {}'.format(epoch))
+        # if primary: print('begin epoch {}'.format(epoch))
 
         model.train()
         optimizer.zero_grad()
+        
+        train_loader_tqdm = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}/{num_epochs}",
+            unit="batch",
+            leave=True,
+            dynamic_ncols=True,
+        )
 
-        for images, targets, info in train_loader:
+        for images, targets, info in train_loader_tqdm:
             cur_iterations += 1
 
             images = [image.to(device).float()/255 for image in images]
-
             gpu_targets = [
                 [{k: v.to(device) for k, v in target_dict.items()} for target_dict in cur_targets]
                 for cur_targets in targets
@@ -304,6 +346,8 @@ def main(args, config):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+
+            train_loader_tqdm.set_postfix(loss=loss.item())
 
             for task_idx in range(len(config['Tasks'])):
                 train_losses[task_idx].append(losses[task_idx].item())
@@ -337,10 +381,10 @@ def main(args, config):
 
                 # Only evaluate on the primary node (for now).
                 if primary:
-                    print('begin evaluation')
+                    print('\n*** Begin evaluation ***')
                     eval_time = time.time()
                     model.eval()
-                    val_loss, val_task_losses, val_scores, _ = satlas.model.evaluate.evaluate(
+                    val_loss, val_task_losses, val_scores, _, precisions, recalls = satlas.model.evaluate.evaluate(
                         config=config,
                         model=model,
                         device=device,
@@ -350,15 +394,28 @@ def main(args, config):
                     val_score = np.mean(val_scores)
                     model.train()
 
-                    print('summary_epoch {}: train_loss={} (losses={}) val_loss={} (losses={}) val={}/{} (scores={}) elapsed={},{} lr={}'.format(
-                        summary_epoch,
-                        train_loss,
-                        train_task_losses,
-                        val_loss,
-                        val_task_losses,
-                        val_score,
-                        best_score,
-                        val_scores,
+                    list_epoch.append(epoch)
+                    list_summary_epoch.append(summary_epoch)
+                    list_train_loss.append(train_loss)
+                    list_train_task_losses.append(train_task_losses)
+                    list_val_loss.append(val_loss)
+                    list_val_task_losses.append(val_task_losses)
+                    list_val_score.append(val_score)
+                    list_best_score.append(best_score)
+                    list_val_scores.append(val_scores)
+                    list_precision.append(precisions)
+                    list_recall.append(recalls)
+                    
+                    
+                    print('### summary_epoch {}: train_loss={} (losses={}) val_loss={} (losses={}) val={}/{} (scores={}) elapsed={},{} lr={}'.format(
+                        list_summary_epoch[-1],
+                        list_train_loss[-1],
+                        list_train_task_losses[-1],
+                        list_val_loss[-1],
+                        list_val_task_losses[-1],
+                        list_val_score[-1],
+                        list_best_score[-1],
+                        list_val_scores[-1],
                         int(eval_time-summary_prev_time),
                         int(time.time()-eval_time),
                         optimizer.param_groups[0]['lr'],
@@ -370,14 +427,74 @@ def main(args, config):
                     # Model saving.
                     if is_distributed:
                         # Need to access underlying model in the DistributedDataParallel so keys aren't prefixed with "module.X".
-                        state_dict = model.module.state_dict()
+                        # state_dict = model.module.state_dict()
+                        state_dict = {
+                            'model_state_dict': model.module.state_dict(),
+                            'epoch': list_epoch,
+                            'summary_epoch': list_summary_epoch,
+                            'train_loss': list_train_loss,
+                            'train_task_losses': list_train_task_losses,
+                            'val_loss': list_val_loss,
+                            'val_task_losses': list_val_task_losses,
+                            'val_score': list_val_score,
+                            'best_score': list_best_score,
+                            'val_scores': list_val_scores,
+                            'precision': list_precision,
+                            'recall' : list_recall,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+                            'time - eval_time': int(time.time()-eval_time),
+                            'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+                        }
                     else:
-                        state_dict = model.state_dict()
+                        # state_dict = model.state_dict()
+                        print('not distributed')
+                        state_dict = {
+                            'model_state_dict': model.module.state_dict(),
+                            'epoch': list_epoch,
+                            'summary_epoch': list_summary_epoch,
+                            'train_loss': list_train_loss,
+                            'train_task_losses': list_train_task_losses,
+                            'val_loss': list_val_loss,
+                            'val_task_losses': list_val_task_losses,
+                            'val_score': list_val_score,
+                            'best_score': list_best_score,
+                            'val_scores': list_val_scores,
+                            'precision': list_precision,
+                            'recall' : list_recall,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+                            'time - eval_time': int(time.time()-eval_time),
+                            'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+                        }
                     save_atomic(state_dict, save_path, 'last.pth')
 
                     if np.isfinite(val_score) and (best_score is None or val_score > best_score):
+                        state_dict = {
+                            'model_state_dict': model.module.state_dict(),
+                            'epoch': list_epoch,
+                            'summary_epoch': list_summary_epoch,
+                            'train_loss': list_train_loss,
+                            'train_task_losses': list_train_task_losses,
+                            'val_loss': list_val_loss,
+                            'val_task_losses': list_val_task_losses,
+                            'val_score': list_val_score,
+                            'best_score': list_best_score,
+                            'val_scores': list_val_scores,
+                            'precision': list_precision,
+                            'recall' : list_recall,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'eval_time - summary_prev_time': int(eval_time-summary_prev_time),
+                            'time - eval_time': int(time.time()-eval_time),
+                            'optimizer.param_groups[0][lr]': optimizer.param_groups[0]['lr']
+                        }
                         save_atomic(state_dict, save_path, 'best.pth')
                         best_score = val_score
+
+    train_loader_tqdm.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train model.")
